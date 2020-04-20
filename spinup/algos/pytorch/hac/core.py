@@ -61,7 +61,7 @@ class MLPActorCritic(nn.Module):
         with torch.no_grad():
             return self.pi(obs).numpy()
 
-class DDPG():
+class DDPG:
     def __init__(self, ac, pi_lr, q_lr, gamma, polyak, logger):
         self.ac = ac
         self.ac_targ = deepcopy(ac)

@@ -139,93 +139,166 @@ def hac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
 
     # Action limit for clamping: critically, assumes all dimensions share the same bound!
     act_limit = env.action_space.high[0]
-    # Experience buffer
-    replay_buffer = ReplayBuffer(obs_dim=obs_dim, act_dim=act_dim, size=replay_size)
+
+    # obs bounds and offset
+    # obs_bounds = np.array([0.9, 0.07])
+    # state_bounds = torch.FloatTensor(state_bounds_np.reshape(1, -1)).to(device)
+    # state_offset =  np.array([-0.3, 0.0])
+    # state_offset = torch.FloatTensor(state_offset.reshape(1, -1)).to(device)
+    # state_clip_low = np.array([-1.2, -0.07])
+    # state_clip_high = np.array([0.6, 0.07])
 
     # Create actor-critic module and target networks
-    ac = actor_critic(obs_dim[0], act_dim, act_limit, **ac_kwargs)
-    agent = core.DDPG(ac, pi_lr, q_lr, gamma, polyak, logger)
+    k_level = 1
+    acs = [actor_critic(obs_dim[0], act_dim, act_limit, **ac_kwargs)]
+    hac_agents = [core.DDPG(acs[0], pi_lr, q_lr, gamma, polyak, logger)]
+    hac_buffers = [ReplayBuffer(obs_dim=tuple([obs_dim[0]]), act_dim=act_dim, size=replay_size)]
+    for i in range(1, k_level):
+        if i == k_level-1:
+            od = obs_dim[0]
+        else:
+            od = 2*obs_dim[0]
+        acs.append(actor_critic(od, obs_dim[0], act_limit, **ac_kwargs))
+        hac_agents.append(core.DDPG(acs[i], pi_lr, q_lr, gamma, polyak, logger))
+        hac_buffers.append(ReplayBuffer(obs_dim=tuple([od]), act_dim=obs_dim, size=replay_size))
 
-    # Set up model saving
-    logger.setup_pytorch_saver(ac)
+    # agent = core.DDPG(ac, pi_lr, q_lr, gamma, polyak, logger)
+    # threshold = np.array([0.01, 0.02])
+    class HAC:
+        def __init__(self, hac_agents, dur, threshold, logger):
+            self.hac_agents = hac_agents
+            # self.exploration_noise = exploration_noise
+            self.k_level = len(hac_agents)
+            self.dur = dur
+            self.threshold = 0.1
+            self.timestep = 0
+            self.logger = logger
+            self.ep_ret = 0
+            self.ep_len = 0
 
-    def test_agent():
-        for j in range(num_test_episodes):
-            o, d, ep_ret, ep_len = test_env.reset(), False, 0, 0
-            while not (d or (ep_len == max_ep_len)):
-                # Take deterministic actions at test time (noise_scale=0)
-                o, r, d, _ = test_env.step(agent.get_action(o, 0))
-                ep_ret += r
-                ep_len += 1
-            logger.store(TestEpRet=ep_ret, TestEpLen=ep_len)
+        def check_goal(self, obs, goal):
+            for i in range(obs.shape[0]):
+                if abs(obs[i] - goal[i]) > self.threshold:
+                    return 0
+            return 1
+
+        # def update(self, data_agents):
+        #     for data in data_agents:
+        #         self.hac_agents[i].update(data)
+
+        def run(self, env, i_level, hac_buffers, o, goal=()):
+                # Until start_steps have elapsed, randomly sample actions
+                # from a uniform distribution for better exploration. Afterwards,
+                # use the learned policy (with some noise, via act_noise).
+
+                # Step the env
+                for _ in range(self.dur):
+                    og = np.concatenate((o, goal))
+                    if self.timestep > 1000:
+                        a = self.hac_agents[i_level].get_action(og, act_noise)
+                    else:
+                        a = env.action_space.sample()
+                    if i_level > 0:
+                        o2, r, d = self.run(env, i_level-1,  hac_buffers, o, goal=a)
+                    else:
+                        o2, r, d, _ = env.step(a)
+                        self.timestep += 1
+                        self.ep_ret += r
+                        self.ep_len += 1
+                    if i_level < k_level-1:
+                        goal_achieved = self.check_goal(o2, goal)
+                    else:
+                        goal_achieved = r+1
+
+                    og2 = np.concatenate((o2, goal))
+
+                    # r = -1 if goal_achieved else 0
+
+                    # Store experience to replay buffer
+                    hac_buffers[i_level].store(og, a, r, og2, d)
+
+                    # Super critical, easy to overlook step: make sure to update
+                    # most recent observation!
+                    o = o2
+
+                    # # Ignore the "done" signal if it comes from hitting the time
+                    # # horizon (that is, when it's an artificial terminal signal
+                    # # that isn't based on the agent's state)
+                    # d = False if ep_len == max_ep_len else d
+                    if agent.ep_len == max_ep_len or d:
+                        break
+
+                return o2, r, d
+
 
     # Prepare for interaction with environment
+    agent = HAC(hac_agents, dur=1, threshold=10, logger=logger)
     total_steps = steps_per_epoch * epochs
     start_time = time.time()
-    o, ep_ret, ep_len = env.reset(), 0, 0
-
+    o, agent.ep_ret, ep_len = env.reset(), 0, 0
+    delta_update, delta_epoch = 0, 0
     # Main loop: collect experience in env and update/log each epoch
-    for t in range(total_steps):
-
-        # Until start_steps have elapsed, randomly sample actions
-        # from a uniform distribution for better exploration. Afterwards,
-        # use the learned policy (with some noise, via act_noise).
-        if t > start_steps:
-            a = agent.get_action(o, act_noise)
-        else:
-            a = env.action_space.sample()
-
-        # Step the env
-        o2, r, d, _ = env.step(a)
-        ep_ret += r
-        ep_len += 1
-
-        # Ignore the "done" signal if it comes from hitting the time
-        # horizon (that is, when it's an artificial terminal signal
-        # that isn't based on the agent's state)
-        d = False if ep_len == max_ep_len else d
-
-        # Store experience to replay buffer
-        replay_buffer.store(o, a, r, o2, d)
-
-        # Super critical, easy to overlook step: make sure to update
-        # most recent observation!
+    while agent.timestep < total_steps:
+        t0 = agent.timestep
+        o2, r, d, = agent.run(env, len(hac_agents)-1, hac_buffers, o)
         o = o2
+        t = agent.timestep
+        # ep_len += t-t0
+        delta_update += t-t0
+        delta_epoch += t-t0
 
         # End of trajectory handling
-        if d or (ep_len == max_ep_len):
-            logger.store(EpRet=ep_ret, EpLen=ep_len)
-            o, ep_ret, ep_len = env.reset(), 0, 0
 
+        if d or (agent.ep_len == max_ep_len):
+            logger.store(EpRet=agent.ep_ret, EpLen=ep_len)
+            o, agent.ep_ret, agent.ep_len = env.reset(), 0, 0
+    #
         # Update handling
-        if t >= update_after and t % update_every == 0:
+        if t >= update_after and delta_update > update_every:
+            delta_update = 0
             for _ in range(update_every):
-                batch = replay_buffer.sample_batch(batch_size)
-                agent.update(data=batch)
+                for i, replay_buffer in enumerate(hac_buffers):
+                    batch = replay_buffer.sample_batch(batch_size)
+                    agent.hac_agents[i].update(data=batch)
 
         # End of epoch handling
-        if (t + 1) % steps_per_epoch == 0:
+        if (delta_epoch + 1) > steps_per_epoch:
+            delta_epoch = 0
             epoch = (t + 1) // steps_per_epoch
 
             # Save model
             if (epoch % save_freq == 0) or (epoch == epochs):
                 logger.save_state({'env': env}, None)
 
-            # Test the performance of the deterministic version of the agent.
-            test_agent()
-
+        # # Test the performance of the deterministic version of the agent.
+        # test_agent()
+#
             # Log info about epoch
             logger.log_tabular('Epoch', epoch)
             logger.log_tabular('EpRet', with_min_and_max=True)
-            logger.log_tabular('TestEpRet', with_min_and_max=True)
+            # logger.log_tabular('TestEpRet', with_min_and_max=True)
             logger.log_tabular('EpLen', average_only=True)
-            logger.log_tabular('TestEpLen', average_only=True)
+            # logger.log_tabular('TestEpLen', average_only=True)
             logger.log_tabular('TotalEnvInteracts', t)
             logger.log_tabular('QVals', with_min_and_max=True)
             logger.log_tabular('LossPi', average_only=True)
             logger.log_tabular('LossQ', average_only=True)
             logger.log_tabular('Time', time.time() - start_time)
             logger.dump_tabular()
+    # # Set up model saving
+    # logger.setup_pytorch_saver(acs[-1])
+
+    # def test_agent():
+    #     for j in range(num_test_episodes):
+    #         o, d, ep_ret, ep_len = test_env.reset(), False, 0, 0
+    #         while not (d or (ep_len == max_ep_len)):
+    #             # Take deterministic actions at test time (noise_scale=0)
+    #             o, r, d, _ = test_env.step(agent.get_action(o, 0))
+    #             ep_ret += r
+    #             ep_len += 1
+    #         logger.store(TestEpRet=ep_ret, TestEpLen=ep_len)
+
+
 
 
 if __name__ == '__main__':
